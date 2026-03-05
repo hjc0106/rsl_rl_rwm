@@ -8,3 +8,17 @@
 from .memory import Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .wm_base import ConvEncoder, ConvDecoder, WM_MLP, GRUCell, Conv2dSamePad, ImgChLayerNorm
+
+__all__ = [
+    "Memory",
+    "MLP",
+    "EmpiricalDiscountedVariationNormalization",
+    "EmpiricalNormalization",
+    "ConvEncoder",
+    "ConvDecoder",
+    "WM_MLP",
+    "GRUCell",
+    "Conv2dSamePad",
+    "ImgChLayerNorm",
+]

@@ -9,22 +9,108 @@ import os
 import statistics
 import time
 import torch
+import numpy as np
 import warnings
 from collections import deque
+import torch.optim as optim
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, MBPOPPO
+from rsl_rl.algorithms import PPO, RWMPPPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config, EmpiricalNormalization, SystemDynamicsEnsemble
-from rsl_rl.utils import store_code_state
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticWMP, resolve_rnd_config, resolve_symmetry_config, EmpiricalNormalization, SystemDynamicsEnsemble, RWMPSystemDynamicsEnsemble
+from rsl_rl.utils import store_code_state, resolve_obs_groups
 from rsl_rl.modules.plotter import Plotter
 import matplotlib.pyplot as plt
-
+from rsl_rl.modules.depth_predictor import DepthPredictor
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 
-
-class MBPOOnPolicyRunner(OnPolicyRunner):
+class RWMPOnPolicyRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation of actor-critic methods."""
+    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+        self.cfg = train_cfg
+        self.alg_cfg = train_cfg["algorithm"]
+        self.policy_cfg = train_cfg["policy"]
+        self.device = device
+        self.env = env
+
+        # check if multi-gpu is enabled
+        self._configure_multi_gpu()
+
+        # store training configuration
+        self.num_steps_per_env = self.cfg["num_steps_per_env"]
+        self.save_interval = self.cfg["save_interval"]
+
+        # query observations from environment for algorithm construction
+        obs = self.env.get_observations()
+        privileged_obs = obs.clone()
+        default_sets = ["critic"]
+        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
+            default_sets.append("rnd_state")
+        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
+
+        # create the algorithm
+        self.alg = self._construct_algorithm(obs, privileged_obs)
+
+        # depth predictor
+        self.depth_predictor_cfg = self.cfg["depth_predictor"]
+        self.depth_predictor, self.depth_predictor_opt = self._construct_depth_predictor()
+
+        # Decide whether to disable logging
+        # We only log from the process with rank 0 (main process)
+        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
+
+        # Logging
+        self.log_dir = log_dir
+        self.writer = None
+        self.tot_timesteps = 0
+        self.tot_time = 0
+        self.current_learning_iteration = 0
+        self.git_status_repos = [rsl_rl.__file__]
+
+    def _construct_depth_predictor(self) -> tuple[DepthPredictor, optim.Optimizer]:
+        """Construct the depth predictor."""
+        depth_predictor = DepthPredictor(**self.depth_predictor_cfg["model"]).to(self.device)
+        depth_predictor_opt = optim.Adam(depth_predictor.parameters(), 
+            lr=self.depth_predictor_cfg["optimizer"]["learning_rate"], 
+            weight_decay=self.depth_predictor_cfg["optimizer"]["weight_decay"]
+        )
+        return depth_predictor, depth_predictor_opt
+            
+    def _construct_world_model_dataset(self):
+        """Construct the world model dataset."""
+        self.wm_update_interval = self.cfg["base"]["env"]["update_interval"]
+        prop_dim = self.cfg["base"]["env"]["prop_dim"]
+        forward_height_dim = self.cfg["base"]["env"]["forward_height_dim"]
+        resized = self.cfg["base"]["env"]["resized"]
+        self.wm_dataset = {
+            "prop": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, prop_dim),
+                                device=self.device),
+            "action": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,
+                                   self.env.num_actions * self.wm_update_interval), device=self.device),
+            "reward": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,),
+                                  device=self.device),
+        }
+        self.wm_dataset["image"] = torch.zeros(((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
+                                            + resized + (1,)), device=self.device)
+        self.wm_dataset["forward_height_map"] = torch.zeros(
+            (self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, forward_height_dim), device=self.device)
+
+        self.wm_dataset_size = np.zeros(self.env.num_envs)
+
+        self.wm_buffer = {
+            "prop": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, prop_dim),
+                                device='cpu'),
+            "action": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,
+                                   self.env.num_actions * self.wm_update_interval), device='cpu'),
+            "reward": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,),
+                                  device='cpu'),
+        }
+        self.wm_buffer["image"] = torch.zeros(((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
+                                            + resized + (1,)), device='cpu')
+        self.wm_buffer["forward_height_map"] = torch.zeros(
+            (self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, forward_height_dim), device='cpu')
+
+        self.wm_buffer_index = np.zeros(self.env.num_envs)        
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -66,6 +152,36 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
 
+        # history buffer
+        history_dim_per_step = self.policy_cfg["history_dim_per_step"]
+        history_interval = self.policy_cfg["history_interval"]
+        privileged_dim = self.cfg["base"]["env"]["privileged_dim"]
+        prop_dim = self.cfg["base"]["env"]["prop_dim"]
+        height_dim = self.cfg["base"]["env"]["height_dim"]
+        forward_height_dim = self.cfg["base"]["env"]["forward_height_dim"]
+        wm_feature_dim = self.cfg["base"]["env"]["wm_feature_dim"]
+        self.history_buf = torch.zeros((self.env.num_envs, history_interval, history_dim_per_step), device=self.device)
+        # ang_vel、gravity、dof_pos、dof_vel、action
+        obs_without_command = torch.cat((obs["policy"][:, privileged_dim:privileged_dim + 6], obs["policy"][:, privileged_dim + 9:-height_dim]), dim=1)
+        self.history_buf = torch.cat((self.history_buf[:, 1:], obs_without_command.unsqueeze(1)), dim=1)
+        
+        # init world model input
+        sum_wm_dataset_size = 0
+        wm_latent = wm_action = None
+        wm_is_first = torch.ones(self.env.num_envs, device=self.device)
+        wm_obs = {  # ang_vel、gravity、command、dof_pos、dof_vel
+            "prop": obs["policy"][:, privileged_dim: privileged_dim + prop_dim].to(self.device),
+            "is_first": wm_is_first,
+        }
+
+        wm_obs["image"] = torch.zeros(obs['camera'].shape, device=self.device)
+
+        wm_metrics = None
+        wm_action_history = torch.zeros(size=(self.env.num_envs, self.wm_update_interval, self.env.num_actions),
+                                        device=self.device)
+        wm_reward = torch.zeros(self.env.num_envs, device=self.device)
+        wm_feature = torch.zeros((self.env.num_envs, wm_feature_dim), device=self.device)
+
         # imagination
         if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
             self.env.unwrapped.prepare_imagination()
@@ -84,16 +200,76 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
+                    if ((self.env.unwrapped.common_step_counter + 1) % self.wm_update_interval == 0):
+                        # world model obs step
+                        wm_latent, wm_feature = self.alg.get_wm_feature(wm_obs, wm_action, wm_latent)
+                        wm_is_first[:] = 0
                     # Sample actions
-                    actions = self.alg.act(obs)
+                    history = self.history_buf.flatten(1).to(self.device)
+                    actions = self.alg.act(obs, history, wm_feature)
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # update world model input
+                    wm_action_history = torch.cat(
+                        (wm_action_history[:, 1:], actions.unsqueeze(1).to(self.device)), dim=1)
+                    wm_obs = {
+                        "prop": obs["policy"][:, privileged_dim: privileged_dim + prop_dim].to(self.device),
+                        "is_first": wm_is_first,
+                    }
+                    
+                    # store the data in buffer into the dataset before reset
+                    # dones env相关历史buffer数据存进wm_datasets
+                    reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1).cpu().numpy()
+                    if (len(reset_env_ids) > 0):
+                        for k, v in self.wm_dataset.items():
+                                v[reset_env_ids, :] = self.wm_buffer[k][reset_env_ids].to(self.device)
+
+                        self.wm_dataset_size[reset_env_ids] = self.wm_buffer_index[reset_env_ids]
+                        self.wm_buffer_index[reset_env_ids] = 0
+                        sum_wm_dataset_size = np.sum(self.wm_dataset_size)
+                        wm_action_history[reset_env_ids, :] = 0
+                        wm_is_first[reset_env_ids] = 1
+                    wm_action = wm_action_history.flatten(1)
+                    wm_reward += rewards.to(self.device)
+
+                    # store current step into buffer
+                    # 未dones env 相关数据存进wm_buffer wm_buffer_index表示未dones所累加的wm更新迭代次数
+                    if ((self.env.unwrapped.common_step_counter + 1) % self.wm_update_interval == 0):
+                        forward_heightmap = obs['system_extension'][:, :forward_height_dim].to(self.device)
+                        pred_depth_image = self.depth_predictor(forward_heightmap, wm_obs["prop"])
+                        wm_obs["image"] = pred_depth_image
+                        # TODO: sampling some envs to attach camera
+                        wm_obs["image"] = obs['camera'].to(self.device)
+                        self.wm_buffer["forward_height_map"][range(self.env.num_envs), self.wm_buffer_index, :] = forward_heightmap[:].to('cpu')
+                        self.wm_buffer["image"][range(self.env.num_envs), self.wm_buffer_index, :] = wm_obs["image"].to('cpu')
+                        # not_reset_env_ids = (~dones).nonzero(as_tuple=False).flatten().cpu().numpy()
+                        not_reset_env_ids = (1 - wm_is_first).nonzero(as_tuple=False).flatten().cpu().numpy()
+                        if (len(not_reset_env_ids) > 0):
+                            for k, v in wm_obs.items():
+                                if(k != "is_first" and k != "image"):
+                                    self.wm_buffer[k][not_reset_env_ids, self.wm_buffer_index[not_reset_env_ids], :] = v[not_reset_env_ids].to('cpu')
+                            self.wm_buffer["action"][not_reset_env_ids, self.wm_buffer_index[not_reset_env_ids], :] = \
+                                wm_action[not_reset_env_ids, :].to('cpu')
+                            self.wm_buffer["reward"][not_reset_env_ids, self.wm_buffer_index[not_reset_env_ids]] = \
+                                wm_reward[not_reset_env_ids].to('cpu')
+                            self.wm_buffer_index[not_reset_env_ids] += 1
+
+                        wm_reward[:] = 0
+
                     # process the step
                     if it >= start_iter + self.cfg["system_dynamics_warmup_iterations"]:
                         # Process env step and store in buffer
                         self.alg.process_env_step(obs, rewards, dones, extras)
+        
+                    # process history buffer
+                    env_ids = dones.nonzero(as_tuple=False).flatten()
+                    self.history_buf[env_ids] = 0
+                    # ang_vel、gravity、dof_pos、dof_vel、action
+                    obs_without_command = torch.cat((obs["policy"][:, privileged_dim:privileged_dim + 6], obs["policy"][:, privileged_dim + 9:-height_dim]), dim=1)
+                    self.history_buf = torch.cat((self.history_buf[:, 1:], obs_without_command.unsqueeze(1)), dim=1)
+
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
                     self.alg.fill_history_buffer(obs)
@@ -131,9 +307,12 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                 start = stop
 
                 # compute returns
-                self.alg.compute_returns(obs)
+                self.alg.compute_returns(obs, wm_feature)
             
+
+            # update forecast
             mean_system_state_loss, mean_system_sequence_loss, mean_system_bound_loss, mean_system_kl_loss, mean_system_extension_loss, mean_system_contact_loss, mean_system_termination_loss = self.alg.update_system_dynamics()
+
             # update policy
             if it >= start_iter + self.cfg["system_dynamics_warmup_iterations"]:
                 if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
@@ -165,6 +344,23 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            
+            # update world model
+            # history
+            start_time = time.time()
+            if (sum_wm_dataset_size > self.cfg['base']['world_model']['train_start_steps']):
+                
+                # Train depth predictor
+                # if(it % self.cfg['world_model']['optimizer']['training_interval'] == 0):
+                # # Train Depth Predictor
+                #     depth_mse_loss = self.train_depth_predictor()
+                #     self.writer.add_scalar('DepthPredictor/loss', depth_mse_loss, it)
+
+                # Train World Model
+                wm_metrics = self.train_world_model()
+                for name, values in wm_metrics.items():
+                    self.writer.add_scalar('World_model/' + name, float(np.mean(values)), it)
+            print('training world model time:', time.time() - start_time)
 
             # Clear episode infos
             ep_infos.clear()
@@ -183,13 +379,14 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration + 1}.pt"))
 
+    # TODO: need to modify
     def imagine(self):
         start = time.time()
         epistemic_uncertainty = torch.zeros(self.num_imagination_steps, device=self.device)
         self.alg.system_dynamics.reset()
         with torch.inference_mode():
             for i in range(self.num_imagination_steps):
-                if self.alg.system_dynamics.architecture_config["type"] in ["rnn", "rssm"] and self.env.unwrapped.common_step_counter > 0:
+                if self.alg.system_dynamics.forecast_config["type"] in ["rnn", "rssm"] and self.env.unwrapped.common_step_counter > 0:
                     self.state_history = self.state_history[:, -1:]
                     self.action_history = self.action_history[:, -1:]
                 imagination_obs = self.env.unwrapped.get_imagination_observation(self.state_history, self.action_history)
@@ -278,6 +475,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         if self.system_termination_dim > 0:
             self.writer.add_scalar("System Dynamics/termination_loss", locs["mean_system_termination_loss"], locs["it"])
         self.writer.add_scalar("System Dynamics/learning_rate", self.alg.system_dynamics_learning_rate, locs["it"])
+        self.writer.add_scalar("World Model/learning_rate", self.alg.wm_learning_rate, locs["it"])
         
         if locs["it"] % self.save_interval == 0:
             state_traj, action_traj, extension_traj, contact_traj, termination_traj, state_traj_pred, action_traj_pred, extension_traj_pred, contact_traj_pred, termination_traj_pred, traj_autoregressive_error, traj_autoregressive_error_noised_dict = self.alg.evaluate_system_dynamics()
@@ -360,7 +558,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
-    def _construct_algorithm(self, obs) -> PPO:
+    def _construct_algorithm(self, obs, privileged_obs) -> PPO:
         """Construct the actor-critic algorithm."""
         # resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -382,7 +580,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
 
         # initialize the actor-critic
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+        actor_critic: ActorCriticWMP = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
@@ -407,7 +605,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             self.system_termination_dim = obs["system_termination"].shape[-1]
         else:
             self.system_termination_dim = 0
-        system_dynamics = SystemDynamicsEnsemble(
+        system_dynamics = RWMPSystemDynamicsEnsemble(
             system_state_dim, 
             self.env.num_actions, 
             self.system_extension_dim,
@@ -433,7 +631,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         }
         self.action_normalizer.load_state_dict(action_normalizer_state_dict)
 
-        alg: MBPOPPO = alg_class(actor_critic, system_dynamics, self.state_normalizer, self.action_normalizer, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        alg: RWMPPPO = alg_class(actor_critic, system_dynamics, self.state_normalizer, self.action_normalizer, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         self.num_imagination_envs = self.imagination_cfg["num_envs"]
         self.num_imagination_steps = self.imagination_cfg["num_steps_per_env"]
@@ -447,6 +645,9 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         self.env.unwrapped.imagination_action_normalizer = self.action_normalizer
         self.env.unwrapped.system_dynamics = alg.system_dynamics
         self.env.unwrapped.uncertainty_penalty_weight = self.imagination_cfg["uncertainty_penalty_weight"]
+
+        # create world model dataset
+        self._construct_world_model_dataset()
 
         # initialize the storage
         alg.init_storage(
@@ -467,3 +668,56 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         )
 
         return alg
+
+    # TODO: train depth predictor
+    # def train_depth_predictor(self):
+    #     total_mse_loss = 0
+    #     for _ in range(self.depth_predictor_cfg["training_iters"]):
+    #         batch_idx = np.random.choice(self.env.depth_index_without_crawl_tilt, self.depth_predictor_cfg["batch_size"],
+    #                                      replace=True)
+    #         time_index = [np.random.randint(0, self.wm_dataset_size[idx] + 1) for idx in batch_idx]
+    #         forward_heightmap = self.wm_dataset["forward_height_map"][batch_idx, time_index]
+    #         prop = self.wm_dataset["prop"][batch_idx, time_index]
+    #         depth_image = self.wm_dataset["image"][self.env.depth_index_inverse[batch_idx], time_index]
+
+    #         predict_depth_image = self.depth_predictor(forward_heightmap, prop)
+    #         depth_predict_loss = (depth_image - predict_depth_image).pow(2).mean() * self.depth_predictor_cfg[
+    #             "loss_scale"]
+    #         # Gradient step
+    #         self.depth_predictor_opt.zero_grad()
+    #         depth_predict_loss.backward()
+    #         nn.utils.clip_grad_norm_(self.depth_predictor.parameters(), 1)
+    #         self.depth_predictor_opt.step()
+    #         total_mse_loss += depth_predict_loss.detach() / self.depth_predictor_cfg["loss_scale"]
+        
+    #     return float(total_mse_loss / self.depth_predictor_cfg["training_iters"])
+    
+    # train world model
+    def train_world_model(self):
+        iter_num = self.cfg['base']['world_model']['train_steps_per_iter']
+        batch_size = self.cfg['base']['world_model']['batch_size']
+        batch_length = self.cfg['base']['world_model']['batch_length']
+        wm_metrics = {}
+        mets = {}
+        for i in range(iter_num):
+            p = self.wm_dataset_size / np.sum(self.wm_dataset_size)
+            batch_idx = np.random.choice(range(self.env.num_envs), batch_size, replace=True, p=p)
+            batch_length = min(int(self.wm_dataset_size[batch_idx].min()), batch_length)
+            if (batch_length <= 1):
+                continue  # an error occur about the predict loss if batch_length < 1
+            batch_end_idx = [np.random.randint(batch_length, self.wm_dataset_size[idx] + 1) for idx in batch_idx]
+            batch_data = {}
+            for k, v in self.wm_dataset.items():
+                if (k == "forward_height_map"):
+                    continue
+                value = []
+                for idx, end_idx in zip(batch_idx, batch_end_idx):
+                    value.append(v[idx, end_idx - batch_length: end_idx])
+                value = torch.stack(value)
+                batch_data[k] = value
+            is_first = torch.zeros((batch_size, batch_length))
+            is_first[:, 0] = 1
+            batch_data["is_first"] = is_first
+            post, context, mets = self.alg.update_world_model(batch_data)
+        wm_metrics.update(mets)
+        return wm_metrics
