@@ -5,6 +5,7 @@
 
 """Implementation of transitions storage for RL-agent."""
 
-from .rollout_storage import RolloutStorage, RWMPRolloutStorage
+from .rollout_storage import RolloutStorage, RWMPRolloutStorage, WMPRolloutStorage
+from .replay_buffer import ReplayBuffer, AMPReplayBuffer
 
-__all__ = ["RolloutStorage", "RWMPRolloutStorage"]
+__all__ = ["RolloutStorage", "RWMPRolloutStorage", "WMPRolloutStorage", "ReplayBuffer", "AMPReplayBuffer"]

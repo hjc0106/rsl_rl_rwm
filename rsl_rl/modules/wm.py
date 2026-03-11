@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from rsl_rl.utils import RequiresGrad, Optimizer
-from rsl_rl.networks import MultiEncoder, MultiDecoder, MLP, RSSM
+from rsl_rl.networks.wm_networks import MultiEncoder, MultiDecoder, MLP, RSSM
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -95,8 +95,8 @@ class WorldModel(nn.Module):
         self._model_opt = Optimizer(
             "model",
             self.parameters(),
-            config.model_lr,
-            config.opt_eps,
+            float(config.model_lr) if type(config.model_lr) is str else config.model_lr,
+            float(config.opt_eps) if type(config.opt_eps) is str else config.opt_eps,
             config.grad_clip,
             config.weight_decay,
             opt=config.opt,
