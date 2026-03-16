@@ -298,7 +298,7 @@ class WMPOnPolicyRunner:
                 wm_metrics = self.train_world_model()
                 for name, values in wm_metrics.items():
                     self.writer.add_scalar('World_model/' + name, float(np.mean(values)), it)
-            print('training world model time:', time.time() - start_time)
+                print('training world model time:', time.time() - start_time)
 
             # Save code state
             if it == start_iter and not self.disable_logs:
@@ -427,22 +427,17 @@ class WMPOnPolicyRunner:
     
     def save(self, path: str, infos=None):
         # -- Save model
-        saved_dict = {
-            "model_state_dict": self.alg.policy.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "iter": self.current_learning_iteration,
-            "infos": infos,
-        }
-        # -- Save RND model if used
-        if hasattr(self.alg, "rnd") and self.alg.rnd:
-            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
-            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-        
-        saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
-        saved_dict["amp_normalizer"] = self.alg.amp_normalizer
-        saved_dict["world_model_dict"] = self._world_model.state_dict()
-        saved_dict["wm_optimizer_state_dict"] = self._world_model._model_opt._opt.state_dict()
-        torch.save(saved_dict, path)
+        torch.save({
+            'model_state_dict': self.alg.policy.state_dict(),
+            'optimizer_state_dict': self.alg.optimizer.state_dict(),
+            'world_model_dict': self._world_model.state_dict(),
+            'wm_optimizer_state_dict': self._world_model._model_opt._opt.state_dict(),
+            'depth_predictor': self.depth_predictor.state_dict(),
+            # 'discriminator_state_dict': self.alg.discriminator.state_dict(),
+            # 'amp_normalizer': self.alg.amp_normalizer,
+            'iter': self.current_learning_iteration,
+            'infos': infos,
+        }, path)
 
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
@@ -466,9 +461,9 @@ class WMPOnPolicyRunner:
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
             # -- load discriminator
-            self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+            # self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
             # -- load amp normalizer
-            self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
+            # self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
             # -- load world model
             self._world_model.load_state_dict(loaded_dict["world_model_dict"])
             # -- load wm optimizer

@@ -109,7 +109,7 @@ class WorldModel(nn.Module):
         # can set different scale for terms in decoder here
         self._scales = dict(
             reward=config.reward_head["loss_scale"],
-            image = 1.0,
+            image = 1.0,  # 1.0
             # clean_prop = 0,
             # cont=config.cont_head["loss_scale"],
         )
