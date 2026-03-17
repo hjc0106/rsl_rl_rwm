@@ -135,7 +135,8 @@ class WMPOnPolicyRunner:
             "is_first": wm_is_first,
         }
 
-        wm_obs["image"] = torch.zeros(obs['camera'].shape, device=self.device)
+        _resized = self.cfg["base"]["env"]["resized"]  # e.g. (64, 64)
+        wm_obs["image"] = torch.zeros((self.env.num_envs, *_resized, 1), device=self.device)
 
         wm_metrics = None
         wm_action_history = torch.zeros(size=(self.env.num_envs, self.wm_update_interval, self.env.num_actions),
@@ -198,7 +199,7 @@ class WMPOnPolicyRunner:
                         # pred_depth_image = self.depth_predictor(forward_heightmap, wm_obs["prop"])
                         # wm_obs["image"] = pred_depth_image
                         # TODO: sampling some envs to attach camera
-                        wm_obs["image"] = obs['camera'].to(self.device)
+                        wm_obs["image"] = obs['camera'].reshape(self.env.num_envs, *_resized, 1).to(self.device)
                         self.wm_buffer["forward_height_map"][range(self.env.num_envs), self.wm_buffer_index, :] = forward_heightmap[:].to('cpu')
                         self.wm_buffer["image"][range(self.env.num_envs), self.wm_buffer_index, :] = wm_obs["image"].to('cpu')
                         # not_reset_env_ids = (~dones).nonzero(as_tuple=False).flatten().cpu().numpy()
@@ -290,9 +291,9 @@ class WMPOnPolicyRunner:
             if (sum_wm_dataset_size > self.wm_config.train_start_steps):
 
                 # if(it % self.depth_predictor_cfg["training_interval"] == 0):
-                    # Train Depth Predictor
-                    # depth_mse_loss = self.train_depth_predictor()
-                    # self.writer.add_scalar('DepthPredictor/loss', depth_mse_loss, it)
+                #     # Train Depth Predictor
+                #     depth_mse_loss = self.train_depth_predictor()
+                #     self.writer.add_scalar('DepthPredictor/loss', depth_mse_loss, it)
 
                 # Train World Model
                 wm_metrics = self.train_world_model()
@@ -427,22 +428,17 @@ class WMPOnPolicyRunner:
     
     def save(self, path: str, infos=None):
         # -- Save model
-        saved_dict = {
-            "model_state_dict": self.alg.policy.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "iter": self.current_learning_iteration,
-            "infos": infos,
-        }
-        # -- Save RND model if used
-        if hasattr(self.alg, "rnd") and self.alg.rnd:
-            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
-            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-        
-        saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
-        saved_dict["amp_normalizer"] = self.alg.amp_normalizer
-        saved_dict["world_model_dict"] = self._world_model.state_dict()
-        saved_dict["wm_optimizer_state_dict"] = self._world_model._model_opt._opt.state_dict()
-        torch.save(saved_dict, path)
+        torch.save({
+            'model_state_dict': self.alg.policy.state_dict(),
+            'optimizer_state_dict': self.alg.optimizer.state_dict(),
+            'world_model_dict': self._world_model.state_dict(),
+            'wm_optimizer_state_dict': self._world_model._model_opt._opt.state_dict(),
+            'depth_predictor': self.depth_predictor.state_dict(),
+            # 'discriminator_state_dict': self.alg.discriminator.state_dict(),
+            # 'amp_normalizer': self.alg.amp_normalizer,
+            'iter': self.current_learning_iteration,
+            'infos': infos,
+        }, path)
 
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
@@ -466,9 +462,9 @@ class WMPOnPolicyRunner:
         if resumed_training:
             self.current_learning_iteration = loaded_dict["iter"]
             # -- load discriminator
-            self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+            # self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
             # -- load amp normalizer
-            self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
+            # self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
             # -- load world model
             self._world_model.load_state_dict(loaded_dict["world_model_dict"])
             # -- load wm optimizer
@@ -738,3 +734,25 @@ class WMPOnPolicyRunner:
             post, context, mets = self._world_model._train(batch_data)
         wm_metrics.update(mets)
         return wm_metrics
+
+    def train_depth_predictor(self):
+        total_mse_loss = 0
+        for _ in range(self.depth_predictor_cfg["training_iters"]):
+            p = self.wm_dataset_size / np.sum(self.wm_dataset_size)
+            batch_idx = np.random.choice(self.env.num_envs, self.depth_predictor_cfg["batch_size"],
+                                         replace=True, p=p)
+            time_index = [np.random.randint(0, self.wm_dataset_size[idx] + 1) for idx in batch_idx]
+            forward_heightmap = self.wm_dataset["forward_height_map"][batch_idx, time_index]
+            prop = self.wm_dataset["prop"][batch_idx, time_index]
+            depth_image = self.wm_dataset["image"][self.env.depth_index_inverse[batch_idx], time_index]
+
+            predict_depth_image = self.depth_predictor(forward_heightmap, prop)
+            depth_predict_loss = (depth_image - predict_depth_image).pow(2).mean() * self.depth_predictor_cfg[
+                "loss_scale"]
+            # Gradient step
+            self.depth_predictor_opt.zero_grad()
+            depth_predict_loss.backward()
+            nn.utils.clip_grad_norm_(self.depth_predictor.parameters(), 1)
+            self.depth_predictor_opt.step()
+            total_mse_loss += depth_predict_loss.detach() / self.depth_predictor_cfg["loss_scale"]
+        return float(total_mse_loss / self.depth_predictor_cfg["training_iters"])

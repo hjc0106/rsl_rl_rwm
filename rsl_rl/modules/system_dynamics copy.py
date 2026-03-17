@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from rsl_rl.modules.architectures import MLPBase, RNNBase, RSSMDynamicsBase, MLPStateHead, MLPAuxiliaryHead
+from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPAuxiliaryHead
 
 class SystemDynamicsEnsemble(nn.Module):
     def __init__(
@@ -80,19 +80,13 @@ class SystemDynamicsEnsemble(nn.Module):
                 architecture_config=self.architecture_config
             )
         elif self.architecture_config["type"] == "rssm":
-            cfg = dict(self.architecture_config)
-            cfg["embed"] = self.state_dim
-            cfg["num_actions"] = self.action_dim
-            stoch = cfg.get("stoch", 30)
-            discrete = cfg.get("discrete", False)
-            deter = cfg.get("deter", 200)
-            stoch_feat = stoch * discrete if discrete else stoch
-            self.base_output_dim = stoch_feat + deter
+            input_dim = self.state_dim + self.action_dim
+            self.base_output_dim = self.architecture_config["rnn_hidden_size"]
             self.prediction_type = "single"
-            return RSSMDynamicsBase(
-                input_dim=self.state_dim,
+            return RNNBase(
+                input_dim=input_dim,
                 device=self.device,
-                architecture_config=cfg,
+                architecture_config=self.architecture_config
             )
         else:
             raise ValueError("Invalid architecture type.")
