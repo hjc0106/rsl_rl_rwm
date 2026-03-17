@@ -521,17 +521,20 @@ class WMPPPO:
     """
 
     def broadcast_parameters(self):
-        """Broadcast model parameters to all GPUs."""
-        # obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+        """Broadcast model parameters to all GPUs.
+
+        Uses tensor-level NCCL broadcast for each parameter and buffer
+        instead of ``broadcast_object_list`` (which serializes the entire
+        state dict via Python pickle) to minimise communication overhead.
+        """
+        modules_to_sync = [self.policy]
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
-        # broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            modules_to_sync.append(self.rnd.predictor)
+        for module in modules_to_sync:
+            for param in module.parameters():
+                torch.distributed.broadcast(param.data, src=0)
+            for buf in module.buffers():
+                torch.distributed.broadcast(buf, src=0)
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.

@@ -415,22 +415,47 @@ class MotionLoader:
         return torch.cat([joint_pos, foot_pos_local, base_lin_vel, base_ang_vel, joint_vel, z_pos], dim=-1)
 
     def _preload_amp_transitions(self) -> None:
-        """Pre-sample a large pool of (s, s_next) AMP observation pairs."""
-        N = self.num_preload_transition
-        print(f"[MotionLoader] Preloading {N} AMP transitions...")
+        """Pre-sample a large pool of (s, s_next) AMP observation pairs.
 
-        times = self.sample_times(N)
+        In distributed training each rank computes an equal share of the
+        transitions and the results are combined via ``all_gather``, reducing
+        wall-clock time roughly proportionally to the number of GPUs.
+        """
+        import torch.distributed as dist
+
+        N = self.num_preload_transition
+        is_distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if is_distributed else 1
+        rank = dist.get_rank() if is_distributed else 0
+
+        local_N = N // world_size
+        if rank == 0:
+            print(f"[MotionLoader] Preloading {N} AMP transitions (distributed across {world_size} rank(s), {local_N} per rank)...")
+
+        times = self.sample_times(local_N)
         times_next = np.clip(times + self._time_between_frames, 0.0, self.duration)
 
-        dof_pos, dof_vel, body_pos, body_rot, body_lin_vel, body_ang_vel = self.sample(N, times=times)
-        self.preloaded_s = self._compute_amp_obs(dof_pos, dof_vel, body_pos, body_rot, body_lin_vel, body_ang_vel)
+        dof_pos, dof_vel, body_pos, body_rot, body_lin_vel, body_ang_vel = self.sample(local_N, times=times)
+        local_s = self._compute_amp_obs(dof_pos, dof_vel, body_pos, body_rot, body_lin_vel, body_ang_vel)
 
-        dof_pos_n, dof_vel_n, body_pos_n, body_rot_n, body_lin_vel_n, body_ang_vel_n = self.sample(N, times=times_next)
-        self.preloaded_s_next = self._compute_amp_obs(
+        dof_pos_n, dof_vel_n, body_pos_n, body_rot_n, body_lin_vel_n, body_ang_vel_n = self.sample(local_N, times=times_next)
+        local_s_next = self._compute_amp_obs(
             dof_pos_n, dof_vel_n, body_pos_n, body_rot_n, body_lin_vel_n, body_ang_vel_n
         )
 
-        print(f"[MotionLoader] Finished preloading. AMP obs shape: {self.preloaded_s.shape}")
+        if is_distributed:
+            gathered_s = [torch.zeros_like(local_s) for _ in range(world_size)]
+            gathered_s_next = [torch.zeros_like(local_s_next) for _ in range(world_size)]
+            dist.all_gather(gathered_s, local_s)
+            dist.all_gather(gathered_s_next, local_s_next)
+            self.preloaded_s = torch.cat(gathered_s, dim=0)
+            self.preloaded_s_next = torch.cat(gathered_s_next, dim=0)
+        else:
+            self.preloaded_s = local_s
+            self.preloaded_s_next = local_s_next
+
+        if rank == 0:
+            print(f"[MotionLoader] Finished preloading. AMP obs shape: {self.preloaded_s.shape}")
 
     def feed_forward_generator(self, num_mini_batch: int, mini_batch_size: int):
         """Yield ``(s, s_next)`` batches of expert AMP observations.
