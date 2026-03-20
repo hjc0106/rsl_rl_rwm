@@ -67,6 +67,7 @@ class WMPOnPolicyRunner:
         self.depth_predictor = DepthPredictor().to(self._world_model.device)
         self.depth_predictor_opt = optim.Adam(self.depth_predictor.parameters(), lr=self.depth_predictor_cfg["lr"],
                                               weight_decay=self.depth_predictor_cfg["weight_decay"])
+        self.depth_index = self.env.unwrapped.depth_index
         self.depth_index_inverse = self.env.unwrapped.depth_index_inverse
 
         # Decide whether to disable logging
@@ -123,7 +124,6 @@ class WMPOnPolicyRunner:
         height_dim = self.cfg["base"]["env"]["height_dim"]
         forward_height_dim = self.cfg["base"]["env"]["forward_height_dim"]
         wm_feature_dim = self.cfg["base"]["env"]["wm_feature_dim"]
-        depth_index = self.env.unwrapped.depth_index
         depth_camera_num_envs = self.env.unwrapped.camera_num_envs
         self.history_buf = torch.zeros((self.env.num_envs, history_interval, history_dim_per_step), device=self.device)
         # ang_vel、gravity、dof_pos、dof_vel、action
@@ -190,7 +190,7 @@ class WMPOnPolicyRunner:
                         for k, v in self.wm_dataset.items():
                             if(k == "image"):
                                 for id in reset_env_ids:
-                                    idx_in_buffer = np.where(depth_index == id)[0]
+                                    idx_in_buffer = np.where(self.depth_index == id)[0]
                                     if(len(idx_in_buffer) > 0):
                                         v[idx_in_buffer, :] = self.wm_buffer[k][idx_in_buffer].to(self.device)
                             else:
@@ -208,9 +208,9 @@ class WMPOnPolicyRunner:
                         pred_depth_image = self.depth_predictor(forward_heightmap, wm_obs["prop"])
                         wm_obs["image"] = pred_depth_image
                         # TODO: sampling some envs to attach camera
-                        wm_obs["image"][depth_index] = obs['camera'][depth_index].reshape(depth_camera_num_envs, *_resized, 1).to(self.device)
+                        wm_obs["image"][self.depth_index] = obs['camera'][self.depth_index].reshape(depth_camera_num_envs, *_resized, 1).to(self.device)
                         self.wm_buffer["forward_height_map"][range(self.env.num_envs), self.wm_buffer_index, :] = forward_heightmap[:].to('cpu')
-                        self.wm_buffer["image"][range(depth_camera_num_envs), self.wm_buffer_index[depth_index], :] = wm_obs["image"][self.env.depth_index].to('cpu')
+                        self.wm_buffer["image"][range(depth_camera_num_envs), self.wm_buffer_index[self.depth_index], :] = wm_obs["image"][self.depth_index].to('cpu')
                         # not_reset_env_ids = (~dones).nonzero(as_tuple=False).flatten().cpu().numpy()
                         not_reset_env_ids = (1 - wm_is_first).nonzero(as_tuple=False).flatten().cpu().numpy()
                         if (len(not_reset_env_ids) > 0):
@@ -734,7 +734,19 @@ class WMPOnPolicyRunner:
                     continue
                 value = []
                 for idx, end_idx in zip(batch_idx, batch_end_idx):
-                    value.append(v[idx, end_idx - batch_length: end_idx])
+                    if (k == "image"):
+                        idx_in_buffer = np.where(self.depth_index == idx)[0]
+                        if (len(idx_in_buffer) == 0):
+                            # not in the buffer, use the predicted ones
+                            tmp_forward_heightmap = self.wm_dataset["forward_height_map"][idx,
+                                                    end_idx - batch_length: end_idx]
+                            tmp_prop = self.wm_dataset["prop"][idx, end_idx - batch_length: end_idx]
+                            pred_depth_image = self.depth_predictor(tmp_forward_heightmap, tmp_prop)
+                            value.append(pred_depth_image)
+                        else:
+                            value.append(v[idx_in_buffer[0], end_idx - batch_length: end_idx])
+                    else:
+                        value.append(v[idx, end_idx - batch_length: end_idx])
                 value = torch.stack(value)
                 batch_data[k] = value
             is_first = torch.zeros((self.wm_config.batch_size, batch_length))
