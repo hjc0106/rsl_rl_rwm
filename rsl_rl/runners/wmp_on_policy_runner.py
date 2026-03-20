@@ -188,7 +188,6 @@ class WMPOnPolicyRunner:
                     reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1).cpu().numpy()
                     if (len(reset_env_ids) > 0):
                         for k, v in self.wm_dataset.items():
-                            v[reset_env_ids, :] = self.wm_buffer[k][reset_env_ids].to(self.device)
                             if(k == "image"):
                                 for id in reset_env_ids:
                                     idx_in_buffer = np.where(depth_index == id)[0]
