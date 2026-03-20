@@ -67,6 +67,8 @@ class WMPOnPolicyRunner:
         self.depth_predictor = DepthPredictor().to(self._world_model.device)
         self.depth_predictor_opt = optim.Adam(self.depth_predictor.parameters(), lr=self.depth_predictor_cfg["lr"],
                                               weight_decay=self.depth_predictor_cfg["weight_decay"])
+        self.depth_index_inverse = self.env.unwrapped.depth_index_inverse
+
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
@@ -121,6 +123,8 @@ class WMPOnPolicyRunner:
         height_dim = self.cfg["base"]["env"]["height_dim"]
         forward_height_dim = self.cfg["base"]["env"]["forward_height_dim"]
         wm_feature_dim = self.cfg["base"]["env"]["wm_feature_dim"]
+        depth_index = self.env.unwrapped.depth_index
+        depth_camera_num_envs = self.env.unwrapped.camera_num_envs
         self.history_buf = torch.zeros((self.env.num_envs, history_interval, history_dim_per_step), device=self.device)
         # ang_vel、gravity、dof_pos、dof_vel、action
         obs_without_command = torch.cat((obs["policy"][:, privileged_dim:privileged_dim + 6], obs["policy"][:, privileged_dim + 9:-height_dim]), dim=1)
@@ -184,8 +188,14 @@ class WMPOnPolicyRunner:
                     reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1).cpu().numpy()
                     if (len(reset_env_ids) > 0):
                         for k, v in self.wm_dataset.items():
+                            v[reset_env_ids, :] = self.wm_buffer[k][reset_env_ids].to(self.device)
+                            if(k == "image"):
+                                for id in reset_env_ids:
+                                    idx_in_buffer = np.where(depth_index == id)[0]
+                                    if(len(idx_in_buffer) > 0):
+                                        v[idx_in_buffer, :] = self.wm_buffer[k][idx_in_buffer].to(self.device)
+                            else:
                                 v[reset_env_ids, :] = self.wm_buffer[k][reset_env_ids].to(self.device)
-
                         self.wm_dataset_size[reset_env_ids] = self.wm_buffer_index[reset_env_ids]
                         self.wm_buffer_index[reset_env_ids] = 0
                         sum_wm_dataset_size = np.sum(self.wm_dataset_size)
@@ -196,12 +206,12 @@ class WMPOnPolicyRunner:
 
                     if ((self.env.unwrapped.common_step_counter + 1) % self.wm_update_interval == 0):
                         forward_heightmap = obs['forward_height'].to(self.device)
-                        # pred_depth_image = self.depth_predictor(forward_heightmap, wm_obs["prop"])
-                        # wm_obs["image"] = pred_depth_image
+                        pred_depth_image = self.depth_predictor(forward_heightmap, wm_obs["prop"])
+                        wm_obs["image"] = pred_depth_image
                         # TODO: sampling some envs to attach camera
-                        wm_obs["image"] = obs['camera'].reshape(self.env.num_envs, *_resized, 1).to(self.device)
+                        wm_obs["image"][depth_index] = obs['camera'][depth_index].reshape(self.env.num_envs, *_resized, 1).to(self.device)
                         self.wm_buffer["forward_height_map"][range(self.env.num_envs), self.wm_buffer_index, :] = forward_heightmap[:].to('cpu')
-                        self.wm_buffer["image"][range(self.env.num_envs), self.wm_buffer_index, :] = wm_obs["image"].to('cpu')
+                        self.wm_buffer["image"][range(depth_camera_num_envs), self.wm_buffer_index[depth_index], :] = wm_obs["image"][self.env.depth_index].to('cpu')
                         # not_reset_env_ids = (~dones).nonzero(as_tuple=False).flatten().cpu().numpy()
                         not_reset_env_ids = (1 - wm_is_first).nonzero(as_tuple=False).flatten().cpu().numpy()
                         if (len(not_reset_env_ids) > 0):
@@ -290,10 +300,10 @@ class WMPOnPolicyRunner:
             start_time = time.time()
             if (sum_wm_dataset_size > self.wm_config.train_start_steps):
 
-                # if(it % self.depth_predictor_cfg["training_interval"] == 0):
-                #     # Train Depth Predictor
-                #     depth_mse_loss = self.train_depth_predictor()
-                #     self.writer.add_scalar('DepthPredictor/loss', depth_mse_loss, it)
+                if(it % self.depth_predictor_cfg["training_interval"] == 0):
+                    # Train Depth Predictor
+                    depth_mse_loss = self.train_depth_predictor()
+                    self.writer.add_scalar('DepthPredictor/loss', depth_mse_loss, it)
 
                 # Train World Model
                 wm_metrics = self.train_world_model()
@@ -601,7 +611,7 @@ class WMPOnPolicyRunner:
             "reward": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,),
                                   device=self.device),
         }
-        self.wm_dataset["image"] = torch.zeros(((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
+        self.wm_dataset["image"] = torch.zeros(((self.env.unwrapped.camera_num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
                                             + resized + (1,)), device=self.device)
         self.wm_dataset["forward_height_map"] = torch.zeros(
             (self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, forward_height_dim), device=self.device)
@@ -616,7 +626,7 @@ class WMPOnPolicyRunner:
             "reward": torch.zeros((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,),
                                   device='cpu'),
         }
-        self.wm_buffer["image"] = torch.zeros(((self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
+        self.wm_buffer["image"] = torch.zeros(((self.env.unwrapped.camera_num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3,)
                                             + resized + (1,)), device='cpu')
         self.wm_buffer["forward_height_map"] = torch.zeros(
             (self.env.num_envs, int(self.env.max_episode_length / self.wm_update_interval) + 3, forward_height_dim), device='cpu')
@@ -744,7 +754,7 @@ class WMPOnPolicyRunner:
             time_index = [np.random.randint(0, self.wm_dataset_size[idx] + 1) for idx in batch_idx]
             forward_heightmap = self.wm_dataset["forward_height_map"][batch_idx, time_index]
             prop = self.wm_dataset["prop"][batch_idx, time_index]
-            depth_image = self.wm_dataset["image"][self.env.depth_index_inverse[batch_idx], time_index]
+            depth_image = self.wm_dataset["image"][self.depth_index_inverse[batch_idx], time_index]
 
             predict_depth_image = self.depth_predictor(forward_heightmap, prop)
             depth_predict_loss = (depth_image - predict_depth_image).pow(2).mean() * self.depth_predictor_cfg[
