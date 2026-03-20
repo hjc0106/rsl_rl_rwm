@@ -208,7 +208,7 @@ class WMPOnPolicyRunner:
                         pred_depth_image = self.depth_predictor(forward_heightmap, wm_obs["prop"])
                         wm_obs["image"] = pred_depth_image
                         # TODO: sampling some envs to attach camera
-                        wm_obs["image"][depth_index] = obs['camera'][depth_index].reshape(self.env.num_envs, *_resized, 1).to(self.device)
+                        wm_obs["image"][depth_index] = obs['camera'][depth_index].reshape(depth_camera_num_envs, *_resized, 1).to(self.device)
                         self.wm_buffer["forward_height_map"][range(self.env.num_envs), self.wm_buffer_index, :] = forward_heightmap[:].to('cpu')
                         self.wm_buffer["image"][range(depth_camera_num_envs), self.wm_buffer_index[depth_index], :] = wm_obs["image"][self.env.depth_index].to('cpu')
                         # not_reset_env_ids = (~dones).nonzero(as_tuple=False).flatten().cpu().numpy()
