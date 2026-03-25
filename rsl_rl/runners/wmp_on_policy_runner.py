@@ -435,7 +435,19 @@ class WMPOnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, load_optimizer: bool = True, map_location: str | None = None):
+    def load(
+        self,
+        path: str,
+        load_optimizer: bool = True,
+        map_location: str | None = None,
+        load_world_model: bool = True,
+    ):
+        """Load checkpoint.
+
+        Args:
+            load_world_model: If False, skip ``world_model_dict`` and ``wm_optimizer_state_dict`` so the current
+                world model (e.g. after decoder architecture changes) keeps randomly initialized weights.
+        """
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
@@ -456,11 +468,13 @@ class WMPOnPolicyRunner:
             # self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
             # -- load amp normalizer
             # self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
-            # -- load world model
-            self._world_model.load_state_dict(loaded_dict["world_model_dict"])
-            # -- load wm optimizer
-            self._world_model._model_opt._opt.load_state_dict(loaded_dict["wm_optimizer_state_dict"])
-            return loaded_dict["infos"]
+            # -- load world model (optional: skip when using policy-only pretrained weights)
+            if load_world_model:
+                self._world_model.load_state_dict(loaded_dict["world_model_dict"])
+                self._world_model._model_opt._opt.load_state_dict(loaded_dict["wm_optimizer_state_dict"])
+            else:
+                print("[INFO] Skipping world model and WM optimizer weights from checkpoint (policy-only load).")
+            return loaded_dict.get("infos")
 
     def get_inference_policy(self, device=None):
         self.eval_mode()  # switch to evaluation mode (dropout for example)
