@@ -12,6 +12,7 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .symmetry import *
 from .system_dynamics import SystemDynamicsEnsemble
+from .system_rssm_dynamics import SystemRSSMDynamicsEnsemble
 from .wm_system_dynamics import RWMPSystemDynamicsEnsemble
 from .depth_predictor import DepthPredictor
 from .actor_critic_wmp import ActorCriticWMP
@@ -22,6 +23,7 @@ __all__ = [
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "SystemDynamicsEnsemble",
+    "SystemRSSMDynamicsEnsemble",
     "RWMPSystemDynamicsEnsemble",
     "DepthPredictor",
     "ActorCriticWMP"

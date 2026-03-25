@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from rsl_rl.utils import RequiresGrad, Optimizer
-from rsl_rl.networks import MultiEncoder, MultiDecoder, MLP, RSSM
+from rsl_rl.networks.wm_networks import MultiEncoder, MultiDecoder, MLP, RSSM
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -66,6 +66,10 @@ class WorldModel(nn.Module):
         self.heads["decoder"] = MultiDecoder(
             feat_size, obs_shape, **config.decoder, use_camera=use_camera
         )
+        # add
+        self.heads["forward_height_map"] = MultiDecoder(
+            feat_size, {"forward_height_map": (525, )}, **config.decoder, use_camera=False
+        )
         self.heads["reward"] = MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
@@ -77,6 +81,18 @@ class WorldModel(nn.Module):
             outscale=config.reward_head["outscale"],
             device=config.device,
             name="Reward",
+        )
+        self.heads["danger"] = MLP(
+            feat_size,
+            (),
+            config.danger_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist=config.danger_head["dist"],
+            outscale=config.danger_head["outscale"],
+            device=config.device,
+            name="Danger",
         )
         # self.heads["cont"] = networks.MLP(
         #     feat_size,
@@ -95,8 +111,8 @@ class WorldModel(nn.Module):
         self._model_opt = Optimizer(
             "model",
             self.parameters(),
-            config.model_lr,
-            config.opt_eps,
+            float(config.model_lr) if type(config.model_lr) is str else config.model_lr,
+            float(config.opt_eps) if type(config.opt_eps) is str else config.opt_eps,
             config.grad_clip,
             config.weight_decay,
             opt=config.opt,
@@ -109,7 +125,9 @@ class WorldModel(nn.Module):
         # can set different scale for terms in decoder here
         self._scales = dict(
             reward=config.reward_head["loss_scale"],
-            image = 1.0,
+            image = 0.0,
+            forward_height_map = 1.0,  # add
+            danger=config.danger_head["loss_scale"],
             # clean_prop = 0,
             # cont=config.cont_head["loss_scale"],
         )
@@ -171,6 +189,7 @@ class WorldModel(nn.Module):
                 torch.mean(self.dynamics.get_dist(post).entropy())
             )
             context = dict(
+                
                 embed=embed,
                 feat=self.dynamics.get_feat(post),
                 kl=kl_value,

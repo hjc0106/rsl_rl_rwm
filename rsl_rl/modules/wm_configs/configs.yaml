@@ -19,7 +19,7 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward']
+  grad_heads: ['decoder', 'reward', 'danger']
   units: 512 # = other heads except decoder, e.g., reward
   act: 'SiLU'
   norm: True
@@ -33,6 +33,8 @@ defaults:
     {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
   reward_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
+  danger_head:
+    {layers: 2, dist: 'symlog_mse', loss_scale: 1.0, outscale: 1.0}
   cont_head:
     {layers: 2, loss_scale: 1.0, outscale: 1.0}
   dyn_scale: 0.5
@@ -43,7 +45,7 @@ defaults:
   initial: 'learned'
 
   # Training
-  train_steps_per_iter: 10
+  train_steps_per_iter: 20
   train_start_steps: 10000
   batch_size: 16
   batch_length: 64

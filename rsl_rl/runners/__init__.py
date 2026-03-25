@@ -9,5 +9,7 @@ from .on_policy_runner import OnPolicyRunner  # isort:skip
 from .distillation_runner import DistillationRunner
 from .mbpo_on_policy_runner import MBPOOnPolicyRunner   
 from .rwmp_on_policy_runner import RWMPOnPolicyRunner
+from .amp_on_policy_runner import AMPOnPolicyRunner
+from .wmp_on_policy_runner import WMPOnPolicyRunner
 
-__all__ = ["OnPolicyRunner", "DistillationRunner", "MBPOOnPolicyRunner", "RWMPOnPolicyRunner"]
+__all__ = ["OnPolicyRunner", "DistillationRunner", "MBPOOnPolicyRunner", "RWMPOnPolicyRunner", "AMPOnPolicyRunner", "WMPOnPolicyRunner"]

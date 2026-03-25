@@ -9,6 +9,7 @@ from .memory import Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .wm_base import ConvEncoder, ConvDecoder, WM_MLP, GRUCell, Conv2dSamePad, ImgChLayerNorm
+from .amp_discriminator import AMPDiscriminator
 
 __all__ = [
     "Memory",
@@ -21,4 +22,5 @@ __all__ = [
     "GRUCell",
     "Conv2dSamePad",
     "ImgChLayerNorm",
+    "AMPDiscriminator",
 ]

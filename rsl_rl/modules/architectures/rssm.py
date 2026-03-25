@@ -92,20 +92,56 @@ class RSSMBase(nn.Module):
                 requires_grad=True,
             )
     
-    def forward(self, x_state_batch, x_action_batch):
-        """"
+    def forward(self, embed, action, is_first, imagine_action):
+        """Observe a context window then imagine future latent state distributions.
+
+        Two-phase operation:
+          Phase 1 — Posterior inference (observe):
+            Process the context sequence with real observations to obtain the
+            posterior latent state at every step.
+          Phase 2 — Prior imagination (imagine):
+            Starting from the last posterior state, roll out future latent states
+            driven by `imagine_action` without any new observations.
+
         Args:
-            x_state_batch: (batch_size, history_horizon, state_dim)
-            x_action_batch: (batch_size, history_horizon, action_dim)
+            embed:          (batch, context_len, embed_dim)
+                            Encoded observations for the context window.
+            action:         (batch, context_len, action_dim)
+                            Actions taken during the context window.
+            is_first:       (batch, context_len)
+                            Episode-start flags; 1 = beginning of a new episode.
+            imagine_action: (batch, imagine_horizon, action_dim)
+                            Future actions used to roll out the imagined trajectory.
+
         Returns:
-            x: (batch_size, hidden_dim)
+            prior_feat: (batch, imagine_horizon, stoch_feat_dim + deter_dim)
+                        Feature vectors of the imagined future latent states,
+                        obtained via get_feat(prior).  Ready for downstream
+                        decoding or policy conditioning.
+            prior:      dict — distribution parameters of each imagined step.
+                        Keys: "stoch", "deter", and either
+                          • "mean", "std"   (continuous stochastic)
+                          • "logit"         (discrete stochastic)
+                        Use get_dist(prior) to obtain the full distribution object.
+            post:       dict — posterior states for the entire context window.
+                        Same key structure as prior, with an extra time dimension.
+                        Used for computing KL( posterior ‖ prior ) during training.
         """
-        x = torch.cat([x_state_batch, x_action_batch], -1)
-        x = self._img_in_layers(x)
-        for _ in range(self._rec_depth):
-            x = self._cell(x, x)
-        x = self._img_out_layers(x)
-        return x
+        # Phase 1: encode context with real observations → full posterior sequence
+        post, _ = self.observe(embed, action, is_first)
+
+        # Extract the last time-step of the posterior as the imagination seed.
+        # post values have shape (batch, context_len, ...), so [:, -1] gives
+        # the single-step state dict that imagine_with_action expects.
+        init = {k: v[:, -1] for k, v in post.items()}
+
+        # Phase 2: roll out imagined future states from the last posterior state
+        prior = self.imagine_with_action(action, init)
+
+        # Concatenate stoch + deter into a flat feature vector for each imagined step
+        prior_feat = self.get_feat(prior)
+
+        return prior_feat, prior, post
 
     def initial(self, batch_size):
         deter = torch.zeros(batch_size, self._deter).to(self.device)

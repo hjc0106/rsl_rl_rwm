@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from rsl_rl.modules.architectures import MLPBase, RNNBase, MLPStateHead, MLPAuxiliaryHead, RSSMDynamicsBase
+from rsl_rl.modules.architectures import MLPBase, RNNBase, RSSMDynamicsBase, MLPStateHead, MLPAuxiliaryHead
+from rsl_rl.networks import WM_MLP
 
-class SystemDynamicsEnsemble(nn.Module):
+class SystemRSSMDynamicsEnsemble(nn.Module):
     def __init__(
         self,
         state_dim: int,
@@ -33,7 +34,7 @@ class SystemDynamicsEnsemble(nn.Module):
     def _init_networks(self):
         self.state_base = self._create_base()
         self.state_heads = nn.ModuleList([
-            MLPStateHead(
+            WM_MLP(
                 self.base_output_dim,
                 self.state_dim,
                 self.device,
@@ -43,7 +44,7 @@ class SystemDynamicsEnsemble(nn.Module):
 
         self.auxiliary_base = self._create_base()
         self.auxiliary_heads = nn.ModuleList([
-            MLPAuxiliaryHead(
+            WM_MLP(
                 self.base_output_dim,
                 self.extension_dim,
                 self.contact_dim,
@@ -88,7 +89,7 @@ class SystemDynamicsEnsemble(nn.Module):
             deter = cfg.get("deter", 200)
             stoch_feat = stoch * discrete if discrete else stoch
             self.base_output_dim = stoch_feat + deter
-            self.prediction_type = "single"
+            self.prediction_type = "sequence"
             return RSSMDynamicsBase(
                 input_dim=self.state_dim,
                 device=self.device,
@@ -99,7 +100,10 @@ class SystemDynamicsEnsemble(nn.Module):
 
     def forward(self, x_state_batch, x_action_batch, model_ids=None):
         state_means, state_stds, extensions, contacts, terminations = [], [], [], [], []
-        state_base_output = self.state_base(x_state_batch, x_action_batch)
+        if self.architecture_config["type"] == "rssm":
+            state_base_output = self.state_base.imagine(x_state_batch, x_action_batch)
+        else:
+            state_base_output = self.state_base(x_state_batch, x_action_batch)
         
         for head in self.state_heads:
             state_mean, state_std = head(state_base_output, x_state_batch)
@@ -108,8 +112,11 @@ class SystemDynamicsEnsemble(nn.Module):
                 state_std = state_std[:, -1]
             state_means.append(state_mean.unsqueeze(0))
             state_stds.append(state_std.unsqueeze(0))
-
-        auxiliary_base_output = self.auxiliary_base(x_state_batch, x_action_batch)
+        if self.architecture_config["type"] == "rssm":
+            auxiliary_base_output = self.auxiliary_base.imagine(x_state_batch, x_action_batch)
+        else:
+            auxiliary_base_output = self.auxiliary_base(x_state_batch, x_action_batch)
+        
         for head in self.auxiliary_heads:
             extension, contact, termination = head(auxiliary_base_output, x_state_batch)
             if self.prediction_type == "sequence":
@@ -192,57 +199,14 @@ class SystemDynamicsEnsemble(nn.Module):
         return state_loss, sequence_loss, bound_loss, kl_loss, extension_loss, contact_loss, termination_loss
 
     def compute_state_loss(self, head, state_batch, action_batch):
-        forecast_horizon = state_batch.shape[1] - self.history_horizon
-        x_state_batch = state_batch[:, :self.history_horizon]
-        state_losses = []
-        sequence_losses = []
-        bound_losses = []
-        kl_losses = []
-        
-        for i in range(forecast_horizon):
-            if self.prediction_type == "single":
-                state_target = state_batch[:, self.history_horizon + i]
-            elif self.prediction_type == "sequence":
-                state_target = state_batch[:, i + 1:self.history_horizon + i + 1]
-            else:
-                raise ValueError("Invalid state prediction type.")
-            
-            if self.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
-                x_action_batch = action_batch[:, self.history_horizon + i:self.history_horizon + i + 1]
-                if self.prediction_type == "sequence":
-                    state_target = state_target[:, [-1]]
-            else:
-                x_action_batch = action_batch[:, i + 1:self.history_horizon + i + 1]
-            
-            state_mean_pred, state_std_pred = head.forward(self.state_base.forward(x_state_batch, x_action_batch), x_state_batch)
-            state_loss, sequence_loss = self.compute_regression_loss(state_mean_pred, state_std_pred, state_target)
-            bound_loss = self.compute_bound_loss(head) if head.output_std else torch.tensor(0.0, device=self.device)
-            kl_loss = self.state_base.kl_loss if self.architecture_config["type"] == "rssm" else torch.tensor(0.0, device=self.device)
-            
-            state_losses.append(state_loss.unsqueeze(0))
-            sequence_losses.append(sequence_loss.unsqueeze(0))
-            bound_losses.append(bound_loss.unsqueeze(0))
-            kl_losses.append(kl_loss.unsqueeze(0))
-            
-            if self.prediction_type == "sequence":
-                state_mean_pred = state_mean_pred[:, -1]
-                state_std_pred = state_std_pred[:, -1]
-            
-            if self.architecture_config["type"] in ["rnn", "rssm"]:
-                x_state_batch = (torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred).unsqueeze(1) if head.output_std else state_mean_pred.unsqueeze(1)
-            else:
-                x_state_batch = torch.cat(
-                    [
-                        x_state_batch[:, 1:].clone(),
-                        (torch.randn_like(state_mean_pred, device=self.device) * state_std_pred + state_mean_pred).unsqueeze(1) if head.output_std else state_mean_pred.unsqueeze(1),
-                    ],
-                    dim=1
-                )
-        
-        state_loss = torch.mean(torch.cat(state_losses, dim=0), dim=0)
-        sequence_loss = torch.mean(torch.cat(sequence_losses, dim=0), dim=0)
-        bound_loss = torch.mean(torch.cat(bound_losses, dim=0), dim=0)
-        kl_loss = torch.mean(torch.cat(kl_losses, dim=0), dim=0)
+        # kl_loss
+        state_target = state_batch[:, self.history_horizon:]
+        _, _ =self.state_base.forward(state_batch, action_batch)
+        kl_loss = self.state_base.kl_loss if self.architecture_config["type"] == "rssm" else torch.tensor(0.0, device=self.device)
+        state_mean_pred, state_std_pred = head.forward(self.state_base.imagine(state_batch, action_batch, self.history_horizon)).mode()
+        state_loss, sequence_loss = self.compute_regression_loss(state_mean_pred, state_std_pred, state_target)
+        bound_loss = self.compute_bound_loss(head) if head.output_std else torch.tensor(0.0, device=self.device)
+
         return state_loss, sequence_loss, bound_loss, kl_loss
 
     def compute_auxiliary_loss(self, head, state_batch, action_batch, extension_batch, contact_batch, termination_batch):

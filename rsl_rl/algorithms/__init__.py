@@ -9,5 +9,7 @@ from .distillation import Distillation
 from .ppo import PPO
 from .mbpo_ppo import MBPOPPO
 from .rwmp_ppo import RWMPPPO
+from .amp_ppo import AMPPPO
+from .wmp_ppo import WMPPPO
 
-__all__ = ["PPO", "Distillation", "MBPOPPO", "RWMPPPO"]
+__all__ = ["PPO", "Distillation", "MBPOPPO", "RWMPPPO", "AMPPPO", "WMPPPO"]
